@@ -19,7 +19,7 @@ const DISASM: &[u8] = &[
     0x10, 0x60, //str r0, [r2, #0x0]
 ];
 
-fn disassembly(file_bc: &str) {
+fn disassembly(file_ll: &str) {
     //create the IR file
     let context = Context::create();
     let module = context.create_module("cpu");
@@ -91,20 +91,15 @@ fn disassembly(file_bc: &str) {
     );
 
     //cpu function
-    let cpu_fun_type = void_type.fn_type(&[isize_type.into()], false);
-    let cpu_fun = module.add_function(
-        "cpu",
-        cpu_fun_type,
-        None,
-    );
-    let kind_id = Attribute::get_named_enum_kind_id("alwaysinline");
-    let att = context.create_type_attribute(
-        kind_id,
-        cpu_fun_type.into(),
-    );
-    cpu_fun.add_attribute(AttributeLoc::Function, att);
-    let basic_block = context.append_basic_block(cpu_fun, "entry");
-    builder.position_at_end(basic_block);
+    let cpu_fun_type = i32_type.fn_type(&[isize_type.into()], false);
+    let cpu_fun = module.add_function("cpu", cpu_fun_type, None);
+    if true {
+        //add inline to cpu fun
+        let kind_id = Attribute::get_named_enum_kind_id("alwaysinline");
+        let att = context.create_type_attribute(kind_id, cpu_fun_type.into());
+        cpu_fun.add_attribute(AttributeLoc::Function, att);
+    }
+    let entry_block = context.append_basic_block(cpu_fun, "entry");
     //TODO: impl switch to all the addrs
     let emu_ptr = cpu_fun.get_nth_param(0).unwrap().into_int_value();
 
@@ -124,22 +119,61 @@ fn disassembly(file_bc: &str) {
         .endian(capstone::Endian::Little)
         .build()
         .expect("Unable to create capstone");
-
     let instrs = cs.disasm_all(DISASM, 0).unwrap();
-    for inst in instrs.as_ref() {
+
+    //create the switch for a variable jump
+    builder.position_at_end(entry_block);
+    let pc = builder
+        .build_call(
+            get_reg_fun,
+            &[emu_ptr.into(), i32_type.const_int(15, false).into()],
+            "",
+        )
+        .try_as_basic_value()
+        .left()
+        .unwrap()
+        .into_int_value();
+    let invalid_addr_block =
+        context.append_basic_block(cpu_fun, "invalid_addr");
+
+    builder.position_at_end(invalid_addr_block);
+    let ret = i32_type.const_int(1 as u64, false);
+    builder.build_return(Some(&ret));
+
+    //create all the inst blocks
+    let mut switch_blocks = Vec::with_capacity(instrs.len());
+    for (inst_i, inst) in instrs.iter().enumerate() {
+        let addr = inst.address();
+        let name = format!("addr_{}", addr);
+        let block = context.append_basic_block(cpu_fun, &name);
+        if let Some((_, last_block)) = switch_blocks.last() {
+            //last block jump to this one
+            builder.position_at_end(*last_block);
+        } else {
+            //last block in entry (switch)
+            builder.position_at_end(entry_block);
+        }
+        builder.build_unconditional_branch(block);
+
+        builder.position_at_end(block);
+
         //update pc before each inst
         let step = i32_type.const_int(inst.bytes().len() as u64, false);
-        let pc = builder
+        let pc_old = builder
             .build_call(
                 get_reg_fun,
                 &[emu_ptr.into(), i32_type.const_int(15, false).into()],
-                "",
+                &format!("pc_old_{}", inst_i),
             )
             .try_as_basic_value()
             .left()
             .unwrap()
             .into_int_value();
-        let pc_new = builder.build_int_add(pc, step.into(), "pc_new");
+        let pc_new = builder.build_int_add(
+            pc_old,
+            step.into(),
+            &format!("pc_new_{}", inst_i),
+        );
         builder.build_call(
             set_reg_fun,
             &[
@@ -176,8 +210,8 @@ fn disassembly(file_bc: &str) {
             ) => {
                 let reg1 = i32_type.const_int(reg(reg1.0).into(), false);
                 let reg2 = i32_type.const_int(reg(mem.base().0).into(), false);
-                let offset = i32_type
-                    .const_int(mem.disp().unsigned_abs().into(), true);
+                let offset =
+                    i32_type.const_int(mem.disp().unsigned_abs().into(), true);
                 builder
                     .build_call(
                         load_fun,
@@ -208,8 +242,8 @@ fn disassembly(file_bc: &str) {
             ) => {
                 let reg1 = i32_type.const_int(reg(reg1.0).into(), false);
                 let reg2 = i32_type.const_int(reg(mem.base().0).into(), false);
-                let offset = i32_type
-                    .const_int(mem.disp().unsigned_abs().into(), true);
+                let offset =
+                    i32_type.const_int(mem.disp().unsigned_abs().into(), true);
                 builder.build_call(
                     store_fun,
                     &[emu_ptr.into(), reg1.into(), reg2.into(), offset.into()],
@@ -241,22 +275,40 @@ fn disassembly(file_bc: &str) {
             }
             _ => todo!(),
         }
-    }
-    builder.build_return(None);
 
-    module.write_bitcode_to_path(Path::new(&file_bc));
+        let addr_const = i32_type.const_int(addr as u64, false);
+        //addr_blocks.push((addr, name, block));
+        switch_blocks.push((addr_const, block));
+    }
+
+    //create the switch that will jump to inst blocks
+    builder.position_at_end(entry_block);
+    let _addr_switch =
+        builder.build_switch(pc.into(), invalid_addr_block, &switch_blocks);
+
+    let exit_ok = context.append_basic_block(cpu_fun, "exit_ok");
+    builder.position_at_end(exit_ok);
+    let ret = i32_type.const_int(0 as u64, false);
+    builder.build_return(Some(&ret));
+
+    //last inst goes to exit_ok
+    let (_, last_block) = switch_blocks.last().unwrap();
+    builder.position_at_end(*last_block);
+    builder.build_unconditional_branch(exit_ok);
+
+    module.print_to_file(Path::new(&file_ll)).unwrap();
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let out_dir = env::var("OUT_DIR").unwrap();
     let filename = "emu";
-    let file_bc = format!("{}/{}.{}", out_dir, filename, "bc");
+    let file_ll = format!("{}/{}.{}", out_dir, filename, "ll");
 
-    disassembly(&file_bc);
+    disassembly(&file_ll);
 
     //compile emu
     cc::Build::new()
-        .file(&file_bc)
+        .file(&file_ll)
         //TODO: complete clang path
         .compiler("clang")
         //.opt_level(3)
