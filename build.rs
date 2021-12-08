@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
 use std::path::Path;
@@ -9,14 +10,17 @@ use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::context::Context;
 
 const DISASM: &[u8] = &[
-    0x00, 0xbf, //nop
-    0x00, 0x48, //ldr r0, [pc, #0]
-    0x00, 0xbf, //nop
-    0x00, 0x49, //ldr r1, [pc, #0]
-    0x00, 0xbf, //nop
-    0x00, 0x4A, //ldr r2, [pc, #0]
-    0x08, 0x44, //add r0, r1
-    0x10, 0x60, //str r0, [r2, #0x0]
+    /* addr: 0x0000 */ 0x00, 0xbf, //nop
+    /* addr: 0x0002 */ 0x00, 0x48, //ldr r0, [pc, #0]
+    /* addr: 0x0004 */ 0x00, 0xbf, //nop
+    /* addr: 0x0006 */ 0x00, 0x49, //ldr r1, [pc, #0]
+    /* addr: 0x0008 */ 0x00, 0xbf, //nop
+    /* addr: 0x000A */ 0x00, 0x4A, //ldr r2, [pc, #0]
+    /* addr: 0x000C */ 0x00, 0xbf, //nop
+    /* addr: 0x000E */ 0x00, 0x4B, //ldr r3, [pc, #0]
+    /* addr: 0x0010 */ 0x18, 0x45, //bx  r3
+    /* addr: 0x0012 */ 0x08, 0x44, //add r0, r1
+    /* addr: 0x0014 */ 0x10, 0x60, //str r0, [r2, #0x0]
 ];
 
 fn disassembly(file_ll: &str) {
@@ -90,6 +94,13 @@ fn disassembly(file_ll: &str) {
         None,
     );
 
+    //bx function
+    let bx_fun = module.add_function(
+        "bx",
+        void_type.fn_type(&[isize_type.into(), i32_type.into()], false),
+        None,
+    );
+
     //cpu function
     let cpu_fun_type = i32_type.fn_type(&[isize_type.into()], false);
     let cpu_fun = module.add_function("cpu", cpu_fun_type, None);
@@ -99,13 +110,12 @@ fn disassembly(file_ll: &str) {
         let att = context.create_type_attribute(kind_id, cpu_fun_type.into());
         cpu_fun.add_attribute(AttributeLoc::Function, att);
     }
-    let entry_block = context.append_basic_block(cpu_fun, "entry");
     //TODO: impl switch to all the addrs
     let emu_ptr = cpu_fun.get_nth_param(0).unwrap().into_int_value();
 
     //easy reg convert
     let reg = |x| match x {
-        66..=68 => x - 66, //r0..r2
+        66..=69 => x - 66, //r0..r3
         11 => 15,          //pc
         _ => todo!("unknown reg {}", x),
     };
@@ -121,68 +131,41 @@ fn disassembly(file_ll: &str) {
         .expect("Unable to create capstone");
     let instrs = cs.disasm_all(DISASM, 0).unwrap();
 
-    //create the switch for a variable jump
+    // entry goes to switch
+    let entry_block = context.append_basic_block(cpu_fun, "entry");
+    let switch_block = context.append_basic_block(cpu_fun, "switch");
     builder.position_at_end(entry_block);
-    let pc = builder
-        .build_call(
-            get_reg_fun,
-            &[emu_ptr.into(), i32_type.const_int(15, false).into()],
-            "",
-        )
-        .try_as_basic_value()
-        .left()
-        .unwrap()
-        .into_int_value();
+    builder.build_unconditional_branch(switch_block);
+
+    //the invalid addr block
     let invalid_addr_block =
         context.append_basic_block(cpu_fun, "invalid_addr");
-
     builder.position_at_end(invalid_addr_block);
     let ret = i32_type.const_int(1 as u64, false);
     builder.build_return(Some(&ret));
 
-    //create all the inst blocks
-    let mut switch_blocks = Vec::with_capacity(instrs.len());
-    for (inst_i, inst) in instrs.iter().enumerate() {
+    //create all the inst blocks, emtpy for now
+    let mut switch_blocks = HashMap::with_capacity(instrs.len());
+    for inst in instrs.iter() {
         let addr = inst.address();
         let name = format!("addr_{}", addr);
         let block = context.append_basic_block(cpu_fun, &name);
-        if let Some((_, last_block)) = switch_blocks.last() {
-            //last block jump to this one
-            builder.position_at_end(*last_block);
-        } else {
-            //last block in entry (switch)
-            builder.position_at_end(entry_block);
-        }
-        builder.build_unconditional_branch(block);
+        switch_blocks.insert(addr, block);
+    }
 
-        builder.position_at_end(block);
+    //create exit correctly block
+    let exit_ok = context.append_basic_block(cpu_fun, "exit_ok");
+    builder.position_at_end(exit_ok);
+    let ret = i32_type.const_int(0 as u64, false);
+    builder.build_return(Some(&ret));
 
-        //update pc before each inst
-        let step = i32_type.const_int(inst.bytes().len() as u64, false);
-        let pc_old = builder
-            .build_call(
-                get_reg_fun,
-                &[emu_ptr.into(), i32_type.const_int(15, false).into()],
-                &format!("pc_old_{}", inst_i),
-            )
-            .try_as_basic_value()
-            .left()
-            .unwrap()
-            .into_int_value();
-        let pc_new = builder.build_int_add(
-            pc_old,
-            step.into(),
-            &format!("pc_new_{}", inst_i),
-        );
-        builder.build_call(
-            set_reg_fun,
-            &[
-                emu_ptr.into(),
-                i32_type.const_int(15, false).into(),
-                pc_new.into(),
-            ],
-            "",
-        );
+
+    //create all the inst blocks
+    for (inst_i, inst) in instrs.iter().enumerate() {
+        let addr = inst.address();
+        let block = switch_blocks.get_mut(&addr).unwrap();
+        builder.position_at_end(*block);
+
         let detail: InsnDetail = cs.insn_detail(&inst).unwrap();
         let arch_detail: ArchDetail = detail.arch_detail();
         let ops = arch_detail.operands();
@@ -192,6 +175,9 @@ fn disassembly(file_ll: &str) {
                 builder
                     .build_call(nop_fun, &[emu_ptr.into()], "")
                     .try_as_basic_value();
+                builder.build_unconditional_branch(
+                    *switch_blocks.get(&(addr + 2)).unwrap_or(&exit_ok),
+                );
             }
             //ldr
             (
@@ -224,6 +210,9 @@ fn disassembly(file_ll: &str) {
                         "",
                     )
                     .try_as_basic_value();
+                builder.build_unconditional_branch(
+                    *switch_blocks.get(&(addr + 2)).unwrap_or(&exit_ok),
+                );
             }
             //str
             (
@@ -249,6 +238,9 @@ fn disassembly(file_ll: &str) {
                     &[emu_ptr.into(), reg1.into(), reg2.into(), offset.into()],
                     "",
                 );
+                builder.build_unconditional_branch(
+                    *switch_blocks.get(&(addr + 2)).unwrap_or(&exit_ok),
+                );
             }
             //add
             (
@@ -272,29 +264,53 @@ fn disassembly(file_ll: &str) {
                     &[emu_ptr.into(), reg1.into(), reg2.into()],
                     "",
                 );
+                builder.build_unconditional_branch(
+                    *switch_blocks.get(&(addr + 2)).unwrap_or(&exit_ok),
+                );
             }
-            _ => todo!(),
+            //bx
+            (
+                29,
+                &[ArchOperand::ArmOperand(arch::arm::ArmOperand {
+                    vector_index: None,
+                    subtracted: false,
+                    shift: ArmShift::Invalid,
+                    op_type: ArmOperandType::Reg(RegId(reg1)),
+                }), ArchOperand::ArmOperand(arch::arm::ArmOperand {
+                    vector_index: None,
+                    subtracted: false,
+                    shift: ArmShift::Invalid,
+                    op_type: ArmOperandType::Reg(RegId(reg2)),
+                })],
+            ) => {
+                let _reg1 = i32_type.const_int(reg(reg1).into(), false);
+                let reg2 = i32_type.const_int(reg(reg2).into(), false);
+                builder.build_call(bx_fun, &[emu_ptr.into(), reg2.into()], "");
+                //jump to the switch after bx
+                builder.build_unconditional_branch(switch_block);
+            }
+            x => todo!("{:?}", x),
         }
-
-        let addr_const = i32_type.const_int(addr as u64, false);
-        //addr_blocks.push((addr, name, block));
-        switch_blocks.push((addr_const, block));
     }
 
-    //create the switch that will jump to inst blocks
-    builder.position_at_end(entry_block);
+    //switch block load the pc and jump to the addr block
+    builder.position_at_end(switch_block);
+    let pc = builder
+        .build_call(
+            get_reg_fun,
+            &[emu_ptr.into(), i32_type.const_int(15, false).into()],
+            "",
+        )
+        .try_as_basic_value()
+        .left()
+        .unwrap()
+        .into_int_value();
+    let blocks = switch_blocks
+        .iter()
+        .map(|(k, v)| (i32_type.const_int(*k, false), *v))
+        .collect::<Vec<_>>();
     let _addr_switch =
-        builder.build_switch(pc.into(), invalid_addr_block, &switch_blocks);
-
-    let exit_ok = context.append_basic_block(cpu_fun, "exit_ok");
-    builder.position_at_end(exit_ok);
-    let ret = i32_type.const_int(0 as u64, false);
-    builder.build_return(Some(&ret));
-
-    //last inst goes to exit_ok
-    let (_, last_block) = switch_blocks.last().unwrap();
-    builder.position_at_end(*last_block);
-    builder.build_unconditional_branch(exit_ok);
+        builder.build_switch(pc.into(), invalid_addr_block, blocks.as_slice());
 
     module.print_to_file(Path::new(&file_ll)).unwrap();
 }
